@@ -1,0 +1,38 @@
+name: Limitless Bot - 2 Hour Scans
+
+on:
+  # RUNS EVERY 2 HOURS
+  schedule:
+    - cron: '0 */2 * * *'  # Runs at 0:00, 2:00, 4:00, etc.
+  
+  # Manual trigger (optional)
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Get code
+        uses: actions/checkout@v3
+        
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          
+      - name: 🖥️ Install Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser chromium-chromedriver
+          
+      - name: 📦 Install Python packages
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          
+      - name: 🤖 Run Limitless Bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python limitless_bot.py
