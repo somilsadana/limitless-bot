@@ -1,24 +1,20 @@
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import re
 import time
 import requests
 import os
 
 # ==================== CONFIGURATION ====================
-# TELEGRAM SETUP (Get these from Step 3 below)
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 
-# BETTING RULE
-MIN_DISTANCE_PERCENT = 4.0      # Minimum 4% away
-PERFECT_DISTANCE_PERCENT = 10.0 # Perfect bet at 10% away
-USE_ABOVE_TARGET = False        # False = "NO" bets (price BELOW target)
-
-# ALERT TIMING (1 HOUR WINDOW)
-ALERT_WINDOW_MINUTES = 65       # 1 hour + 5 min buffer
+MIN_DISTANCE_PERCENT = 4.0
+PERFECT_DISTANCE_PERCENT = 10.0
+USE_ABOVE_TARGET = False  # True = "YES" bets, False = "NO" bets
+ALERT_WINDOW_MINUTES = 65  # 1 hour window
 # =======================================================
 
 class LimitlessBot:
@@ -38,8 +34,8 @@ class LimitlessBot:
         return driver
     
     def fetch_limitless_markets(self, driver):
-        """Get markets from Limitless."""
-        print("📡 Fetching markets...")
+        """Get all markets from Limitless."""
+        print("📡 Fetching all markets from Limitless...")
         markets = []
         
         try:
@@ -52,7 +48,7 @@ class LimitlessBot:
             pattern = r'\$([A-Z]{2,5})\s+above\s+\$([\d,]+\.?\d*)\s+on\s+([A-Za-z]+\s+\d+,\s+\d{2}:\d{2}\s+UTC)[^%]*(\d+\.?\d*)%'
             matches = re.findall(pattern, page_html)
             
-            print(f"Found {len(matches)} markets")
+            print(f"✅ Found {len(matches)} markets")
             
             for match in matches:
                 try:
@@ -61,7 +57,6 @@ class LimitlessBot:
                     date_str = match[2]
                     probability = float(match[3])
                     
-                    # Parse closing time
                     closing_time = self.parse_date(date_str)
                     
                     markets.append({
@@ -78,11 +73,12 @@ class LimitlessBot:
                         'reason': ""
                     })
                     
-                except:
+                except Exception as e:
+                    print(f"❌ Error parsing {match[0]}: {e}")
                     continue
                     
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"❌ Fetch error: {e}")
         
         return markets
     
@@ -97,7 +93,8 @@ class LimitlessBot:
             if parsed_time < current_utc:
                 parsed_time = parsed_time.replace(year=current_utc.year + 1)
             return parsed_time
-        except:
+        except Exception as e:
+            print(f"Date parse error: {e}")
             return current_utc
     
     def fetch_current_price(self, asset):
@@ -109,7 +106,7 @@ class LimitlessBot:
                 'AVAX': 'AVAXUSDT', 'DOGE': 'DOGEUSDT', 'LINK': 'LINKUSDT',
                 'TRX': 'TRXUSDT', 'LTC': 'LTCUSDT', 'BCH': 'BCHUSDT',
                 'XLM': 'XLMUSDT', 'HBAR': 'HBARUSDT', 'SUI': 'SUIUSDT',
-                'PAXG': 'PAXGUSDT'
+                'PAXG': 'PAXGUSDT', 'CYS': 'CYSUSDT'
             }
             
             symbol = symbol_map.get(asset)
@@ -121,12 +118,14 @@ class LimitlessBot:
             data = response.json()
             return float(data['price'])
             
-        except:
+        except Exception as e:
+            print(f"⚠️  Price fetch failed for {asset}: {e}")
             return None
     
     def calculate_signal(self, current_price, target_price):
-        """Apply your 4-10% rule."""
+        """Apply the 4-10% rule."""
         price_diff = ((current_price - target_price) / target_price) * 100
+        abs_diff = abs(price_diff)
         
         if USE_ABOVE_TARGET:
             # YES bets (price above target)
@@ -144,7 +143,6 @@ class LimitlessBot:
             if price_diff <= -PERFECT_DISTANCE_PERCENT:
                 return "PERFECT NO", "NO", price_diff, 100, "PERFECT"
             elif -PERFECT_DISTANCE_PERCENT < price_diff <= -MIN_DISTANCE_PERCENT:
-                abs_diff = abs(price_diff)
                 score = 60 + ((abs_diff - MIN_DISTANCE_PERCENT) / 6) * 40
                 return "STRONG NO", "NO", price_diff, int(score), "GOOD"
             elif -MIN_DISTANCE_PERCENT < price_diff < 0:
@@ -153,11 +151,12 @@ class LimitlessBot:
                 return "AVOID", None, price_diff, 0, "NONE"
     
     def analyze_markets(self, markets):
-        """Check all markets."""
-        print(f"\n📊 Looking for: Price {'ABOVE' if USE_ABOVE_TARGET else 'BELOW'} target by 4-10%")
+        """Analyze all markets."""
+        print(f"\n📊 Analyzing {len(markets)} markets...")
         
         for market in markets:
             if market['closing_time_utc'] < datetime.now(timezone.utc):
+                market['signal'] = "CLOSED"
                 continue
             
             current_price = self.fetch_current_price(market['asset'])
@@ -171,98 +170,111 @@ class LimitlessBot:
                 current_price, market['target_price']
             )
             
-            market['price_diff_percent'] = price_diff
-            market['signal'] = signal
-            market['bet_type'] = bet_type
-            market['edge_score'] = score
-            market['bet_quality'] = quality
+            market.update({
+                'price_diff_percent': price_diff,
+                'signal': signal,
+                'bet_type': bet_type,
+                'edge_score': score,
+                'bet_quality': quality
+            })
         
         return markets
     
     def send_telegram_alert(self, market, minutes_left):
-        """Send alert to Telegram."""
+        """Send individual alert for each market."""
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             return False
         
         try:
+            # Choose emoji based on signal
+            emoji = "🎯" if market['bet_quality'] == 'PERFECT' else \
+                    "✅" if market['bet_quality'] == 'GOOD' else \
+                    "➖" if market['signal'] == 'NO BET' else \
+                    "⛔" if market['signal'] == 'AVOID' else "❓"
+            
+            # Get price difference with sign
+            diff_sign = "+" if market['price_diff_percent'] > 0 else ""
+            
             message = (
-                f"🚨 **LIMITLESS BOT ALERT**\n\n"
-                f"🏷️  Asset: {market['asset']}\n"
-                f"⏰ Time Left: {minutes_left} minutes\n"
-                f"🎯 Signal: {market['signal']}\n"
-                f"📊 Bet Type: {market['bet_type']}\n"
-                f"💰 Target: ${market['target_price']:.4f}\n"
-                f"📈 Current: ${market['current_price']:.4f}\n"
-                f"📉 Difference: {market['price_diff_percent']:+.2f}%\n"
-                f"⭐ Score: {market['edge_score']}/100\n\n"
-                f"⏳ Closes: {market['closing_time_utc'].strftime('%H:%M UTC')}\n"
-                f"🔗 https://limitless.exchange"
+                f"{emoji} **{market['asset']}**\n"
+                f"📡 Signal: {market['signal']}\n"
+                f"🎯 Bet Type: {market['bet_type'] or 'NONE'}\n"
+                f"💰 Target: ${market['target_price']:.6f}\n"
+                f"📈 Current: ${market['current_price']:.6f}\n"
+                f"📊 Difference: {diff_sign}{market['price_diff_percent']:.2f}%\n"
+                f"⭐ Score: {market['edge_score']}/100\n"
+                f"📋 Market Prob: {market['probability']}%\n"
+                f"⏰ Closes in: {minutes_left} minutes\n"
+                f"🕐 Close Time: {market['closing_time_utc'].strftime('%H:%M UTC')}"
             )
             
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             payload = {
                 'chat_id': TELEGRAM_CHAT_ID,
                 'text': message,
-                'parse_mode': 'Markdown'
+                'parse_mode': 'Markdown',
+                'disable_web_page_preview': True
             }
             
-            requests.post(url, json=payload, timeout=10)
-            return True
+            response = requests.post(url, json=payload, timeout=10)
+            return response.status_code == 200
             
-        except:
+        except Exception as e:
+            print(f"Telegram error for {market['asset']}: {e}")
             return False
     
     def run(self):
-        """Main function."""
-        print("=" * 60)
-        print("LIMITLESS BOT - 2-HOUR SCANS / 1-HOUR ALERTS")
-        print("=" * 60)
+        """Main function - 2-hour scans with all alerts."""
+        print("=" * 70)
+        print("LIMITLESS BOT - 2-HOUR SCANS")
+        print("ALERTS FOR ALL MARKETS")
+        print("=" * 70)
         
         driver = self.setup_driver()
         alerts_sent = 0
         
         try:
-            # 1. Get markets
+            # 1. Fetch markets
             markets = self.fetch_limitless_markets(driver)
             
             # 2. Analyze
             markets = self.analyze_markets(markets)
             
-            # 3. Check for alerts
+            # 3. Send alerts for ALL markets closing in 1 hour
             now = datetime.now(timezone.utc)
-            print(f"\n🔍 Checking for markets closing in next {ALERT_WINDOW_MINUTES} minutes...")
+            print(f"\n📱 Sending Telegram alerts for markets closing in {ALERT_WINDOW_MINUTES} minutes...")
             
             for market in markets:
-                if market['bet_quality'] in ['PERFECT', 'GOOD']:
+                if market.get('current_price'):
                     minutes_left = (market['closing_time_utc'] - now).total_seconds() / 60
                     
-                    # Only alert if closing in 1 hour
+                    # Only alert for markets closing in our window
                     if 0 < minutes_left <= ALERT_WINDOW_MINUTES:
-                        print(f"\n⚠️  ALERT: {market['asset']} closes in {int(minutes_left)}min")
-                        print(f"   Signal: {market['signal']} | Score: {market['edge_score']}/100")
-                        
-                        # Send to Telegram
                         if self.send_telegram_alert(market, int(minutes_left)):
-                            print(f"   ✅ Telegram alert sent!")
+                            print(f"   ✅ {market['asset']}: {market['signal']} ({market['price_diff_percent']:+.2f}%)")
                             alerts_sent += 1
+                            time.sleep(0.5)  # Small delay between messages
             
-            # Summary
+            # 4. Summary
             perfect = len([m for m in markets if m['bet_quality'] == 'PERFECT'])
             good = len([m for m in markets if m['bet_quality'] == 'GOOD'])
+            no_bet = len([m for m in markets if m['signal'] == 'NO BET'])
+            avoid = len([m for m in markets if m['signal'] == 'AVOID'])
             
-            print(f"\n{'='*60}")
-            print(f"📊 SCAN COMPLETE:")
-            print(f"   Time: {now.strftime('%H:%M UTC')}")
-            print(f"   Markets: {len(markets)}")
-            print(f"   Perfect bets: {perfect}")
-            print(f"   Good bets: {good}")
-            print(f"   Alerts sent: {alerts_sent}")
+            print(f"\n{'='*70}")
+            print("📊 2-HOUR SCAN COMPLETE")
+            print(f"   Scan Time: {now.strftime('%H:%M UTC')}")
+            print(f"   Total Markets: {len(markets)}")
+            print(f"   🎯 Perfect bets: {perfect}")
+            print(f"   ✅ Good bets: {good}")
+            print(f"   ➖ No bets: {no_bet}")
+            print(f"   ⛔ Avoid: {avoid}")
+            print(f"   📱 Alerts sent: {alerts_sent}")
             
-            # Next scan time
-            from datetime import timedelta
+            # Next 2-hour scan
             next_scan = now + timedelta(hours=2)
             print(f"   ⏰ Next scan: {next_scan.strftime('%H:%M UTC')}")
-            print(f"{'='*60}")
+            print(f"{'='*70}")
             
         except Exception as e:
             print(f"❌ Error: {e}")
