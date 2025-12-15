@@ -117,8 +117,8 @@ class LimitlessBot:
             # Return a future time so market doesn't get skipped
             return current_utc + timedelta(days=1)
     
-    def fetch_current_price(self, asset):
-        """Get live price from CoinGecko API."""
+    def fetch_all_prices(self, assets):
+        """Get ALL prices in ONE API call to avoid rate limits."""
         try:
             # Map asset names to CoinGecko IDs
             coin_id_map = {
@@ -141,37 +141,43 @@ class LimitlessBot:
                 'CYS': 'celo'  # Note: Check if this is correct for CYS
             }
             
-            coin_id = coin_id_map.get(asset)
-            if not coin_id:
-                print(f"⚠️  No CoinGecko ID mapping for {asset}")
-                return None
+            # Get unique CoinGecko IDs for all assets
+            coin_ids = []
+            for asset in assets:
+                if asset in coin_id_map:
+                    coin_ids.append(coin_id_map[asset])
             
-            # CoinGecko API (no key needed for free tier)
+            if not coin_ids:
+                print("⚠️  No valid CoinGecko IDs found")
+                return {}
+            
+            # Fetch ALL prices in ONE call
             url = f"https://api.coingecko.com/api/v3/simple/price"
             params = {
-                'ids': coin_id,
+                'ids': ','.join(coin_ids),
                 'vs_currencies': 'usd'
             }
             
-            # Optional: Add a free API key from https://www.coingecko.com/en/api
-            # headers = {'x-cg-demo-api-key': 'YOUR_API_KEY_HERE'}
-            # response = requests.get(url, params=params, headers=headers, timeout=10)
+            print(f"📊 Fetching {len(coin_ids)} prices in one API call...")
             
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.get(url, params=params, timeout=15)
             response.raise_for_status()
-            data = response.json()
+            all_prices = response.json()
             
-            if coin_id not in data:
-                print(f"⚠️  CoinGecko returned no data for {asset} (ID: {coin_id})")
-                return None
+            # Convert back to asset->price mapping
+            asset_prices = {}
+            for asset, coin_id in coin_id_map.items():
+                if coin_id in all_prices and asset in assets:
+                    price = all_prices[coin_id]['usd']
+                    asset_prices[asset] = price
+                    print(f"   💰 {asset}: ${price:.6f}")
             
-            price = data[coin_id]['usd']
-            print(f"   💰 {asset}: ${price:.6f} (via CoinGecko)")
-            return price
+            print(f"✅ Successfully fetched {len(asset_prices)} prices")
+            return asset_prices
             
         except Exception as e:
-            print(f"⚠️  Price fetch failed for {asset}: {e}")
-            return None
+            print(f"❌ Failed to fetch prices: {e}")
+            return {}
     
     def calculate_signal(self, current_price, target_price):
         """Apply the 4-10% rule."""
@@ -205,6 +211,12 @@ class LimitlessBot:
         """Analyze all markets."""
         print(f"\n📊 Analyzing {len(markets)} markets...")
         
+        # Get all assets that need prices
+        assets = [market['asset'] for market in markets]
+        
+        # Fetch ALL prices in ONE call
+        all_prices = self.fetch_all_prices(assets)
+        
         analyzed = 0
         skipped = 0
         
@@ -218,7 +230,8 @@ class LimitlessBot:
                 skipped += 1
                 continue
             
-            current_price = self.fetch_current_price(market['asset'])
+            # Get price from the bulk fetch
+            current_price = all_prices.get(market['asset'])
             if not current_price:
                 market['signal'] = "PRICE FETCH FAILED"
                 skipped += 1
@@ -346,13 +359,13 @@ class LimitlessBot:
             print(f"   ⏰ Next scan: {next_scan.strftime('%H:%M UTC')}")
             print(f"{'='*70}")
             
-            # DEBUG: Show first 3 markets
-            print(f"\n🔍 DEBUG - First 3 markets:")
-            for i, market in enumerate(markets[:3]):
+            # DEBUG: Show all markets
+            print(f"\n🔍 ALL MARKET ANALYSIS:")
+            for i, market in enumerate(markets):
                 signal = market.get('signal', 'NO SIGNAL')
                 price = f"${market.get('current_price', 0):.6f}" if market.get('current_price') else "NO PRICE"
                 diff = f"{market.get('price_diff_percent', 0):+.2f}%" if market.get('price_diff_percent') else "N/A"
-                print(f"  {i+1}. {market['asset']}: {signal}, Price: {price}, Diff: {diff}")
+                print(f"  {i+1:2d}. {market['asset']:5} : {signal:20} | {price:15} | {diff:10}")
             
         except Exception as e:
             print(f"❌ Error: {e}")
