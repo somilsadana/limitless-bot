@@ -1,361 +1,381 @@
-import requests
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from datetime import datetime, timezone, timedelta
+import re
 import time
-import json
-from datetime import datetime, timedelta
-import pytz
-from typing import Dict, List, Optional
-import logging
+import requests
+import os
 
-# ===================== CONFIGURATION =====================
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"  # Can be channel ID or group ID
+# ==================== CONFIGURATION ====================
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 
-# API Configuration
-COINGECKO_API_URL = "https://api.coingecko.com/api/v3/simple/price"
+MIN_DISTANCE_PERCENT = 4.0
+PERFECT_DISTANCE_PERCENT = 10.0
+USE_ABOVE_TARGET = False  # True = "YES" bets, False = "NO" bets
+ALERT_WINDOW_MINUTES = 65  # 1 hour window
+# =======================================================
 
-# Market data with targets and closing times
-MARKETS = [
-    {"symbol": "CYS", "target": 0.2911, "close_time": "2023-12-15 12:00"},
-    {"symbol": "HBAR", "target": 0.1230, "close_time": "2023-12-15 09:00"},
-    {"symbol": "ETH", "target": 3112.28, "close_time": "2023-12-15 06:00"},
-    {"symbol": "AVAX", "target": 12.9470, "close_time": "2023-12-15 18:00"},
-    {"symbol": "TRX", "target": 0.2747, "close_time": "2023-12-15 08:00"},
-    {"symbol": "DOGE", "target": 0.1343, "close_time": "2023-12-15 20:00"},
-    {"symbol": "BNB", "target": 886.61, "close_time": "2023-12-15 16:00"},
-    {"symbol": "ADA", "target": 0.4035, "close_time": "2023-12-15 12:00"},
-    {"symbol": "PAXG", "target": 4322.85, "close_time": "2023-12-15 11:00"},
-    {"symbol": "BTC", "target": 90037.39, "close_time": "2023-12-15 10:00"},
-    {"symbol": "LINK", "target": 13.51, "close_time": "2023-12-16 02:00"},
-    {"symbol": "XLM", "target": 0.2287, "close_time": "2023-12-15 22:00"},
-    {"symbol": "SOL", "target": 131.64, "close_time": "2023-12-15 14:00"},
-    {"symbol": "XRP", "target": 1.9925, "close_time": "2023-12-15 23:00"},
-    {"symbol": "SUI", "target": 1.5695, "close_time": "2023-12-16 04:00"},
-    {"symbol": "LTC", "target": 78.974, "close_time": "2023-12-16 00:00"},
-    {"symbol": "BCH", "target": 570.36, "close_time": "2023-12-15 17:00"},
-]
-
-# Coingecko ID mapping (you need to adjust these to match actual IDs)
-COINGECKO_IDS = {
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "BNB": "binancecoin",
-    "SOL": "solana",
-    "XRP": "ripple",
-    "ADA": "cardano",
-    "AVAX": "avalanche-2",
-    "DOGE": "dogecoin",
-    "LINK": "chainlink",
-    "TRX": "tron",
-    "LTC": "litecoin",
-    "BCH": "bitcoin-cash",
-    "XLM": "stellar",
-    "HBAR": "hedera-hashgraph",
-    "SUI": "sui",
-    "PAXG": "pax-gold",
-    "CYS": "cyclos",  # This might need adjustment
-}
-
-# Analysis thresholds
-PERFECT_THRESHOLD = 0.30  # 0.30% difference for perfect bet
-GOOD_THRESHOLD = 0.50    # 0.50% difference for good bet
-AVOID_THRESHOLD = 1.00   # 1.00% difference to avoid
-
-# ===================== TELEGRAM FUNCTIONS =====================
-def send_telegram_message(message: str):
-    """Send message to Telegram"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
+class LimitlessBot:
+    def __init__(self):
+        self.price_cache = {}
+        
+    def setup_driver(self):
+        """Setup browser for GitHub."""
+        chrome_options = Options()
+        chrome_options.add_argument('--headless')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.binary_location = '/usr/bin/chromium-browser'
+        
+        driver = webdriver.Chrome(options=chrome_options)
+        return driver
     
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code == 200:
-            print(f"✅ Telegram alert sent!")
-            return True
-        else:
-            print(f"❌ Failed to send Telegram alert: {response.text}")
-            return False
-    except Exception as e:
-        print(f"❌ Error sending Telegram message: {e}")
-        return False
-
-def format_market_signal(market_data: Dict, current_price: float, status: str, 
-                         percentage_diff: float, closes_in_minutes: int) -> str:
-    """Format market signal for Telegram"""
-    
-    # Status emojis
-    status_emojis = {
-        "PERFECT": "🎯",
-        "GOOD": "✅", 
-        "NO_BET": "➖",
-        "AVOID": "⛔"
-    }
-    
-    emoji = status_emojis.get(status, "📊")
-    
-    # Determine signal direction
-    if current_price < market_data["target"]:
-        direction = "BELOW"
-        action = "BUY" if status in ["PERFECT", "GOOD"] else "WAIT"
-    else:
-        direction = "ABOVE"
-        action = "SELL" if status in ["PERFECT", "GOOD"] else "WAIT"
-    
-    message = f"""
-{emoji} <b>{market_data['symbol']} - {status}</b>
-━━━━━━━━━━━━━━━━━━
-💰 Current: ${current_price:,.4f}
-🎯 Target: ${market_data['target']:,.4f}
-📈 Difference: {percentage_diff:+.2f}%
-📊 Direction: {direction}
-⚡ Action: {action}
-
-⏰ Closes in: {closes_in_minutes} minutes
-🕒 Close Time: {market_data['close_time']} UTC
-━━━━━━━━━━━━━━━━━━
-"""
-    
-    # Add additional notes based on status
-    if status == "PERFECT":
-        message += "🔥 <b>PERFECT ENTRY POINT!</b>"
-    elif status == "GOOD":
-        message += "👍 <b>Good opportunity</b>"
-    elif status == "NO_BET":
-        message += "🤔 <b>Wait for better entry</b>"
-    elif status == "AVOID":
-        message += "⚠️ <b>Avoid this trade</b>"
-    
-    return message
-
-# ===================== MARKET ANALYSIS =====================
-def get_current_prices():
-    """Fetch current prices from CoinGecko API"""
-    ids = list(COINGECKO_IDS.values())
-    ids_param = ",".join(ids)
-    
-    params = {
-        "ids": ids_param,
-        "vs_currencies": "usd"
-    }
-    
-    try:
-        response = requests.get(COINGECKO_API_URL, params=params, timeout=15)
-        if response.status_code == 200:
-            data = response.json()
+    def fetch_limitless_markets(self, driver):
+        """Get all markets from Limitless."""
+        print("📡 Fetching all markets from Limitless...")
+        markets = []
+        
+        try:
+            driver.get("https://limitless.exchange/pro/cat/daily")
+            time.sleep(5)
             
-            # Convert to symbol-based dictionary
-            prices = {}
-            for symbol, cg_id in COINGECKO_IDS.items():
-                if cg_id in data and "usd" in data[cg_id]:
-                    prices[symbol] = data[cg_id]["usd"]
-                else:
-                    prices[symbol] = 0.0
-                    print(f"⚠️ Price not found for {symbol} ({cg_id})")
+            page_html = driver.page_source
             
-            return prices
+            # Find all markets
+            pattern = r'\$([A-Z]{2,5})\s+above\s+\$([\d,]+\.?\d*)\s+on\s+([A-Za-z]+\s+\d+,\s+\d{2}:\d{2}\s+UTC)[^%]*(\d+\.?\d*)%'
+            matches = re.findall(pattern, page_html)
+            
+            print(f"✅ Found {len(matches)} market patterns")
+            
+            for match in matches:
+                try:
+                    asset = match[0]
+                    target_price = float(match[1].replace(',', ''))
+                    date_str = match[2]
+                    probability = float(match[3])
+                    
+                    closing_time = self.parse_date(date_str)
+                    
+                    markets.append({
+                        'asset': asset,
+                        'target_price': target_price,
+                        'closing_time_utc': closing_time,
+                        'probability': probability,
+                        'current_price': None,
+                        'price_diff_percent': None,
+                        'signal': "PENDING",
+                        'bet_type': None,
+                        'edge_score': 0,
+                        'bet_quality': "NONE",
+                        'reason': ""
+                    })
+                    
+                    print(f"   📍 {asset}: Target ${target_price:.4f}, Closes {closing_time.strftime('%b %d %H:%M UTC')}")
+                    
+                except Exception as e:
+                    print(f"❌ Error parsing {match[0] if match else 'unknown'}: {e}")
+                    continue
+                    
+        except Exception as e:
+            print(f"❌ Fetch error: {e}")
+        
+        return markets
+    
+    def parse_date(self, date_str):
+        """Convert date text like 'Dec 13, 09:00 UTC' to datetime."""
+        current_utc = datetime.now(timezone.utc)
+        
+        try:
+            # Clean the date string
+            date_str = date_str.strip()
+            
+            # Try multiple formats
+            try:
+                # Format: "Dec 13, 09:00 UTC"
+                parsed_time = datetime.strptime(date_str, '%b %d, %H:%M %Z')
+            except:
+                # Format without comma: "Dec 13 09:00 UTC"
+                date_str = date_str.replace(',', '')
+                parsed_time = datetime.strptime(date_str, '%b %d %H:%M %Z')
+            
+            # Set year to current year
+            parsed_time = parsed_time.replace(year=current_utc.year)
+            # Make it timezone aware (UTC)
+            parsed_time = parsed_time.replace(tzinfo=timezone.utc)
+            
+            # If this time is in the past, assume it's next year
+            if parsed_time < current_utc:
+                parsed_time = parsed_time.replace(year=current_utc.year + 1)
+            
+            return parsed_time
+            
+        except Exception as e:
+            print(f"❌ Date parsing failed for '{date_str}': {e}")
+            # Return a future time so market doesn't get skipped
+            return current_utc + timedelta(days=1)
+    
+    def fetch_all_prices(self, assets):
+        """Get ALL prices in ONE API call to avoid rate limits."""
+        try:
+            # Map asset names to CoinGecko IDs
+            coin_id_map = {
+                'BTC': 'bitcoin',
+                'ETH': 'ethereum',
+                'BNB': 'binancecoin',
+                'SOL': 'solana',
+                'XRP': 'ripple',
+                'ADA': 'cardano',
+                'AVAX': 'avalanche-2',
+                'DOGE': 'dogecoin',
+                'LINK': 'chainlink',
+                'TRX': 'tron',
+                'LTC': 'litecoin',
+                'BCH': 'bitcoin-cash',
+                'XLM': 'stellar',
+                'HBAR': 'hedera-hashgraph',
+                'SUI': 'sui',
+                'PAXG': 'pax-gold',
+                'CYS': 'celo'  # Note: Check if this is correct for CYS
+            }
+            
+            # Get unique CoinGecko IDs for all assets
+            coin_ids = []
+            for asset in assets:
+                if asset in coin_id_map:
+                    coin_ids.append(coin_id_map[asset])
+            
+            if not coin_ids:
+                print("⚠️  No valid CoinGecko IDs found")
+                return {}
+            
+            # Fetch ALL prices in ONE call
+            url = f"https://api.coingecko.com/api/v3/simple/price"
+            params = {
+                'ids': ','.join(coin_ids),
+                'vs_currencies': 'usd'
+            }
+            
+            print(f"📊 Fetching {len(coin_ids)} prices in one API call...")
+            
+            response = requests.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            all_prices = response.json()
+            
+            # Convert back to asset->price mapping
+            asset_prices = {}
+            for asset, coin_id in coin_id_map.items():
+                if coin_id in all_prices and asset in assets:
+                    price = all_prices[coin_id]['usd']
+                    asset_prices[asset] = price
+                    print(f"   💰 {asset}: ${price:.6f}")
+            
+            print(f"✅ Successfully fetched {len(asset_prices)} prices")
+            return asset_prices
+            
+        except Exception as e:
+            print(f"❌ Failed to fetch prices: {e}")
+            return {}
+    
+    def calculate_signal(self, current_price, target_price):
+        """Apply the 4-10% rule."""
+        price_diff = ((current_price - target_price) / target_price) * 100
+        abs_diff = abs(price_diff)
+        
+        if USE_ABOVE_TARGET:
+            # YES bets (price above target)
+            if price_diff >= PERFECT_DISTANCE_PERCENT:
+                return "PERFECT YES", "YES", price_diff, 100, "PERFECT"
+            elif MIN_DISTANCE_PERCENT <= price_diff < PERFECT_DISTANCE_PERCENT:
+                score = 60 + ((price_diff - MIN_DISTANCE_PERCENT) / 6) * 40
+                return "STRONG YES", "YES", price_diff, int(score), "GOOD"
+            elif 0 < price_diff < MIN_DISTANCE_PERCENT:
+                return "NO BET", None, price_diff, 0, "NONE"
+            else:
+                return "AVOID", None, price_diff, 0, "NONE"
         else:
-            print(f"❌ API Error: {response.status_code}")
-            return None
-    except Exception as e:
-        print(f"❌ Error fetching prices: {e}")
-        return None
-
-def analyze_market(market_data: Dict, current_price: float) -> Dict:
-    """Analyze a single market and return analysis results"""
+            # NO bets (price below target)
+            if price_diff <= -PERFECT_DISTANCE_PERCENT:
+                return "PERFECT NO", "NO", price_diff, 100, "PERFECT"
+            elif -PERFECT_DISTANCE_PERCENT < price_diff <= -MIN_DISTANCE_PERCENT:
+                score = 60 + ((abs_diff - MIN_DISTANCE_PERCENT) / 6) * 40
+                return "STRONG NO", "NO", price_diff, int(score), "GOOD"
+            elif -MIN_DISTANCE_PERCENT < price_diff < 0:
+                return "NO BET", None, price_diff, 0, "NONE"
+            else:
+                return "AVOID", None, price_diff, 0, "NONE"
     
-    if current_price == 0:
-        return {
-            "status": "ERROR",
-            "percentage_diff": 0,
-            "should_alert": False
-        }
-    
-    # Calculate percentage difference
-    target = market_data["target"]
-    percentage_diff = ((current_price - target) / target) * 100
-    
-    # Determine status based on thresholds
-    abs_diff = abs(percentage_diff)
-    
-    if abs_diff <= PERFECT_THRESHOLD:
-        status = "PERFECT"
-    elif abs_diff <= GOOD_THRESHOLD:
-        status = "GOOD"
-    elif abs_diff <= AVOID_THRESHOLD:
-        status = "NO_BET"
-    else:
-        status = "AVOID"
-    
-    # Calculate closing time in minutes
-    utc_now = datetime.now(pytz.utc)
-    close_time_str = market_data["close_time"]
-    
-    # Parse close time (adjust format if needed)
-    try:
-        close_time = datetime.strptime(close_time_str, "%Y-%m-%d %H:%M")
-        close_time = pytz.utc.localize(close_time)
-        closes_in_minutes = int((close_time - utc_now).total_seconds() / 60)
-    except:
-        closes_in_minutes = 0
-    
-    # Always send alerts for all statuses
-    should_alert = True
-    
-    return {
-        "status": status,
-        "percentage_diff": percentage_diff,
-        "closes_in_minutes": closes_in_minutes,
-        "should_alert": should_alert,
-        "current_price": current_price
-    }
-
-def scan_all_markets():
-    """Main scanning function"""
-    print("=" * 70)
-    print("LIMITLESS BOT - COMPREHENSIVE MARKET SCAN")
-    print("ALERTS FOR ALL MARKET CONDITIONS")
-    print("=" * 70)
-    
-    # Get current time
-    utc_now = datetime.now(pytz.utc)
-    print(f"\n📡 Scan started at: {utc_now.strftime('%H:%M UTC')}")
-    
-    # Fetch all prices
-    print("\n📊 Fetching current prices from CoinGecko...")
-    prices = get_current_prices()
-    
-    if not prices:
-        print("❌ Failed to fetch prices")
-        return
-    
-    print(f"✅ Successfully fetched {len(prices)} prices")
-    
-    # Analyze each market
-    perfect_count = 0
-    good_count = 0
-    no_bet_count = 0
-    avoid_count = 0
-    alert_count = 0
-    error_count = 0
-    
-    print("\n🔍 Analyzing all markets...")
-    print("-" * 70)
-    
-    all_analyses = []
-    
-    for market in MARKETS:
-        symbol = market["symbol"]
-        current_price = prices.get(symbol, 0)
+    def analyze_markets(self, markets):
+        """Analyze all markets."""
+        print(f"\n📊 Analyzing {len(markets)} markets...")
         
-        if current_price == 0:
-            error_count += 1
-            print(f"❌ {symbol}: Price fetch failed")
-            continue
+        # Get all assets that need prices
+        assets = [market['asset'] for market in markets]
         
-        # Analyze market
-        analysis = analyze_market(market, current_price)
-        all_analyses.append((market, analysis))
+        # Fetch ALL prices in ONE call
+        all_prices = self.fetch_all_prices(assets)
         
-        # Update counters
-        status = analysis["status"]
-        if status == "PERFECT":
-            perfect_count += 1
-        elif status == "GOOD":
-            good_count += 1
-        elif status == "NO_BET":
-            no_bet_count += 1
-        elif status == "AVOID":
-            avoid_count += 1
+        analyzed = 0
+        skipped = 0
         
-        # Send Telegram alert for ALL statuses
-        if analysis["should_alert"]:
-            message = format_market_signal(
-                market,
-                analysis["current_price"],
-                status,
-                analysis["percentage_diff"],
-                analysis["closes_in_minutes"]
+        for market in markets:
+            now = datetime.now(timezone.utc)
+            time_diff = (market['closing_time_utc'] - now).total_seconds() / 60  # minutes
+            
+            # Skip markets that already closed
+            if time_diff < -60:  # Closed more than 1 hour ago
+                market['signal'] = "ALREADY CLOSED"
+                skipped += 1
+                continue
+            
+            # Get price from the bulk fetch
+            current_price = all_prices.get(market['asset'])
+            if not current_price:
+                market['signal'] = "PRICE FETCH FAILED"
+                skipped += 1
+                continue
+            
+            market['current_price'] = current_price
+            
+            signal, bet_type, price_diff, score, quality = self.calculate_signal(
+                current_price, market['target_price']
             )
             
-            if send_telegram_message(message):
-                alert_count += 1
-                print(f"📱 {symbol}: {status} alert sent!")
-            else:
-                print(f"❌ {symbol}: Failed to send alert")
+            market.update({
+                'price_diff_percent': price_diff,
+                'signal': signal,
+                'bet_type': bet_type,
+                'edge_score': score,
+                'bet_quality': quality,
+                'minutes_until_close': int(time_diff)
+            })
+            
+            analyzed += 1
         
-        # Print to console
-        print(f"{symbol:4s}: {status:8s} | ${current_price:12.6f} | {analysis['percentage_diff']:+.2f}% | "
-              f"Closes in: {analysis['closes_in_minutes']} min")
+        print(f"   Analyzed: {analyzed}, Skipped: {skipped}")
+        return markets
     
-    # Send summary
-    print("\n" + "=" * 70)
-    print("📊 COMPREHENSIVE SCAN COMPLETE")
-    print("=" * 70)
-    
-    summary = f"""
-📊 SCAN SUMMARY
-━━━━━━━━━━━━━━━━━━
-🕒 Scan Time: {utc_now.strftime('%H:%M UTC')}
-📈 Total Markets: {len(MARKETS)}
-━━━━━━━━━━━━━━━━━━
-🎯 Perfect bets: {perfect_count}
-✅ Good bets: {good_count}
-➖ No bets: {no_bet_count}
-⛔ Avoid: {avoid_count}
-❌ Errors: {error_count}
-━━━━━━━━━━━━━━━━━━
-📱 Alerts sent: {alert_count}
-⏰ Next scan: {(utc_now + timedelta(hours=2)).strftime('%H:%M UTC')}
-━━━━━━━━━━━━━━━━━━
-"""
-    
-    print(summary)
-    send_telegram_message(summary)
-    
-    # Detailed analysis table
-    detail_msg = "📈 <b>DETAILED MARKET ANALYSIS</b>\n"
-    detail_msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    
-    for market, analysis in sorted(all_analyses, key=lambda x: x[0]['symbol']):
-        symbol = market['symbol']
-        status = analysis['status']
-        price = analysis['current_price']
-        diff = analysis['percentage_diff']
+    def send_telegram_alert(self, market, minutes_left):
+        """Send individual alert for each market."""
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            return False
         
-        status_emoji = {
-            "PERFECT": "🎯",
-            "GOOD": "✅",
-            "NO_BET": "➖",
-            "AVOID": "⛔"
-        }.get(status, "📊")
-        
-        detail_msg += f"{status_emoji} <code>{symbol:4s}</code>: {status:8s} | ${price:12.4f} | {diff:+.2f}%\n"
+        try:
+            # Choose emoji based on signal
+            emoji = "🎯" if market['bet_quality'] == 'PERFECT' else \
+                    "✅" if market['bet_quality'] == 'GOOD' else \
+                    "➖" if market['signal'] == 'NO BET' else \
+                    "⛔" if market['signal'] == 'AVOID' else "❓"
+            
+            # Get price difference with sign
+            diff_sign = "+" if market['price_diff_percent'] > 0 else ""
+            
+            message = (
+                f"{emoji} **{market['asset']}**\n"
+                f"📡 Signal: {market['signal']}\n"
+                f"🎯 Bet Type: {market['bet_type'] or 'NONE'}\n"
+                f"💰 Target: ${market['target_price']:.6f}\n"
+                f"📈 Current: ${market['current_price']:.6f}\n"
+                f"📊 Difference: {diff_sign}{market['price_diff_percent']:.2f}%\n"
+                f"⭐ Score: {market['edge_score']}/100\n"
+                f"📋 Market Prob: {market['probability']}%\n"
+                f"⏰ Closes in: {minutes_left} minutes\n"
+                f"🕐 Close Time: {market['closing_time_utc'].strftime('%H:%M UTC')}"
+            )
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = {
+                'chat_id': TELEGRAM_CHAT_ID,
+                'text': message,
+                'parse_mode': 'Markdown',
+                'disable_web_page_preview': True
+            }
+            
+            response = requests.post(url, json=payload, timeout=10)
+            return response.status_code == 200
+            
+        except Exception as e:
+            print(f"Telegram error for {market['asset']}: {e}")
+            return False
     
-    send_telegram_message(detail_msg)
+    def run(self):
+        """Main function - 2-hour scans with all alerts."""
+        print("=" * 70)
+        print("LIMITLESS BOT - 2-HOUR SCANS")
+        print("ALERTS FOR ALL MARKETS")
+        print("=" * 70)
+        
+        driver = self.setup_driver()
+        alerts_sent = 0
+        
+        try:
+            # 1. Fetch markets
+            markets = self.fetch_limitless_markets(driver)
+            
+            # 2. Analyze
+            markets = self.analyze_markets(markets)
+            
+            # 3. Send alerts for ALL markets closing in 1 hour
+            now = datetime.now(timezone.utc)
+            print(f"\n📱 Checking markets closing in {ALERT_WINDOW_MINUTES} minutes...")
+            
+            for market in markets:
+                if market.get('current_price') and market.get('minutes_until_close'):
+                    minutes_left = market['minutes_until_close']
+                    
+                    # Only alert for markets closing in our window
+                    if 0 < minutes_left <= ALERT_WINDOW_MINUTES:
+                        print(f"   🔔 {market['asset']}: {market['signal']} ({market['price_diff_percent']:+.2f}%), closes in {minutes_left}min")
+                        
+                        if self.send_telegram_alert(market, minutes_left):
+                            print(f"      ✅ Telegram alert sent!")
+                            alerts_sent += 1
+                            time.sleep(0.5)  # Small delay between messages
+            
+            # 4. Count signals
+            perfect = len([m for m in markets if m.get('bet_quality') == 'PERFECT'])
+            good = len([m for m in markets if m.get('bet_quality') == 'GOOD'])
+            no_bet = len([m for m in markets if m.get('signal') == 'NO BET'])
+            avoid = len([m for m in markets if m.get('signal') == 'AVOID'])
+            closed = len([m for m in markets if m.get('signal') == 'ALREADY CLOSED'])
+            failed = len([m for m in markets if m.get('signal') == 'PRICE FETCH FAILED'])
+            
+            print(f"\n{'='*70}")
+            print("📊 2-HOUR SCAN COMPLETE")
+            print(f"   Scan Time: {now.strftime('%H:%M UTC')}")
+            print(f"   Total Markets: {len(markets)}")
+            print(f"   🎯 Perfect bets: {perfect}")
+            print(f"   ✅ Good bets: {good}")
+            print(f"   ➖ No bets: {no_bet}")
+            print(f"   ⛔ Avoid: {avoid}")
+            print(f"   🔒 Already closed: {closed}")
+            print(f"   ❌ Price fetch failed: {failed}")
+            print(f"   📱 Alerts sent: {alerts_sent}")
+            
+            # Next 2-hour scan
+            next_scan = now + timedelta(hours=2)
+            print(f"   ⏰ Next scan: {next_scan.strftime('%H:%M UTC')}")
+            print(f"{'='*70}")
+            
+            # DEBUG: Show all markets
+            print(f"\n🔍 ALL MARKET ANALYSIS:")
+            for i, market in enumerate(markets):
+                signal = market.get('signal', 'NO SIGNAL')
+                price = f"${market.get('current_price', 0):.6f}" if market.get('current_price') else "NO PRICE"
+                diff = f"{market.get('price_diff_percent', 0):+.2f}%" if market.get('price_diff_percent') else "N/A"
+                print(f"  {i+1:2d}. {market['asset']:5} : {signal:20} | {price:15} | {diff:10}")
+            
+        except Exception as e:
+            print(f"❌ Error: {e}")
+        finally:
+            try:
+                driver.quit()
+            except:
+                pass
 
-# ===================== MAIN EXECUTION =====================
+# Run the bot
 if __name__ == "__main__":
-    # Configure logging
-    logging.basicConfig(level=logging.INFO)
-    
-    print("🚀 Starting Limitless Trading Bot...")
-    print("⚡ Sending alerts for ALL market conditions")
-    print(f"📱 Telegram notifications enabled for chat: {TELEGRAM_CHAT_ID}")
-    
-    try:
-        # Run the scan
-        scan_all_markets()
-        
-        print("\n✅ Scan completed successfully!")
-        print("📱 Check your Telegram for detailed alerts")
-        
-    except KeyboardInterrupt:
-        print("\n\n⏹️ Bot stopped by user")
-    except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
+    bot = LimitlessBot()
+    bot.run()
