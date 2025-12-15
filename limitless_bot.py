@@ -317,27 +317,30 @@ class LimitlessBot:
             # 2. Analyze
             markets = self.analyze_markets(markets)
             
-            # 3. Send alerts for ALL markets (FIXED - NO TIME WINDOW CHECK)
+            # 3. Send alerts for UPCOMING markets only (not closed)
             now = datetime.now(timezone.utc)
-            print(f"\n📱 Sending alerts for ALL analyzed markets...")
+            print(f"\n📱 Sending alerts for all upcoming markets...")
             
             for market in markets:
                 # Check if market was successfully analyzed
                 if market.get('current_price') and market.get('price_diff_percent') is not None:
                     minutes_left = market.get('minutes_until_close', 0)
                     
-                    # Send alert for EVERY market, regardless of closing time
-                    signal = market.get('signal', 'UNKNOWN')
-                    diff_pct = market.get('price_diff_percent', 0)
-                    
-                    print(f"   🔔 {market['asset']}: {signal} ({diff_pct:+.2f}%), closes in {minutes_left}min")
-                    
-                    if self.send_telegram_alert(market, minutes_left):
-                        print(f"      ✅ Telegram alert sent!")
-                        alerts_sent += 1
-                        time.sleep(0.5)  # Small delay between messages
+                    # Only send alerts for upcoming markets (minutes_left > 0)
+                    if minutes_left > 0:
+                        signal = market.get('signal', 'UNKNOWN')
+                        diff_pct = market.get('price_diff_percent', 0)
+                        
+                        print(f"   🔔 {market['asset']}: {signal} ({diff_pct:+.2f}%), closes in {minutes_left}min")
+                        
+                        if self.send_telegram_alert(market, minutes_left):
+                            print(f"      ✅ Telegram alert sent!")
+                            alerts_sent += 1
+                            time.sleep(0.5)  # Small delay between messages
+                        else:
+                            print(f"      ❌ Telegram alert failed!")
                     else:
-                        print(f"      ❌ Telegram alert failed!")
+                        print(f"   ⏭️  Skipping {market['asset']}: Already closed ({minutes_left}min)")
                 else:
                     # Market couldn't be analyzed properly
                     print(f"   ⚠️  Skipping {market['asset']}: {market.get('signal', 'NO DATA')}")
