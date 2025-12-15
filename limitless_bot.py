@@ -48,7 +48,7 @@ class LimitlessBot:
             pattern = r'\$([A-Z]{2,5})\s+above\s+\$([\d,]+\.?\d*)\s+on\s+([A-Za-z]+\s+\d+,\s+\d{2}:\d{2}\s+UTC)[^%]*(\d+\.?\d*)%'
             matches = re.findall(pattern, page_html)
             
-            print(f"✅ Found {len(matches)} markets")
+            print(f"✅ Found {len(matches)} market patterns")
             
             for match in matches:
                 try:
@@ -73,8 +73,10 @@ class LimitlessBot:
                         'reason': ""
                     })
                     
+                    print(f"   📍 {asset}: Target ${target_price:.4f}, Closes {closing_time.strftime('%b %d %H:%M UTC')}")
+                    
                 except Exception as e:
-                    print(f"❌ Error parsing {match[0]}: {e}")
+                    print(f"❌ Error parsing {match[0] if match else 'unknown'}: {e}")
                     continue
                     
         except Exception as e:
@@ -83,19 +85,37 @@ class LimitlessBot:
         return markets
     
     def parse_date(self, date_str):
-        """Convert date text to datetime."""
+        """Convert date text like 'Dec 13, 09:00 UTC' to datetime."""
         current_utc = datetime.now(timezone.utc)
+        
         try:
-            date_str = date_str.replace(',', '')
-            parsed_time = datetime.strptime(date_str, '%b %d %H:%M %Z')
-            parsed_time = parsed_time.replace(year=current_utc.year, tzinfo=timezone.utc)
+            # Clean the date string
+            date_str = date_str.strip()
             
+            # Try multiple formats
+            try:
+                # Format: "Dec 13, 09:00 UTC"
+                parsed_time = datetime.strptime(date_str, '%b %d, %H:%M %Z')
+            except:
+                # Format without comma: "Dec 13 09:00 UTC"
+                date_str = date_str.replace(',', '')
+                parsed_time = datetime.strptime(date_str, '%b %d %H:%M %Z')
+            
+            # Set year to current year
+            parsed_time = parsed_time.replace(year=current_utc.year)
+            # Make it timezone aware (UTC)
+            parsed_time = parsed_time.replace(tzinfo=timezone.utc)
+            
+            # If this time is in the past, assume it's next year
             if parsed_time < current_utc:
                 parsed_time = parsed_time.replace(year=current_utc.year + 1)
+            
             return parsed_time
+            
         except Exception as e:
-            print(f"Date parse error: {e}")
-            return current_utc
+            print(f"❌ Date parsing failed for '{date_str}': {e}")
+            # Return a future time so market doesn't get skipped
+            return current_utc + timedelta(days=1)
     
     def fetch_current_price(self, asset):
         """Get live price from Binance."""
@@ -111,12 +131,17 @@ class LimitlessBot:
             
             symbol = symbol_map.get(asset)
             if not symbol:
+                print(f"⚠️  No symbol mapping for {asset}")
                 return None
             
             url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
             response = requests.get(url, timeout=10)
+            response.raise_for_status()
             data = response.json()
-            return float(data['price'])
+            price = float(data['price'])
+            
+            print(f"   💰 {asset}: ${price:.6f}")
+            return price
             
         except Exception as e:
             print(f"⚠️  Price fetch failed for {asset}: {e}")
@@ -154,14 +179,23 @@ class LimitlessBot:
         """Analyze all markets."""
         print(f"\n📊 Analyzing {len(markets)} markets...")
         
+        analyzed = 0
+        skipped = 0
+        
         for market in markets:
-            if market['closing_time_utc'] < datetime.now(timezone.utc):
-                market['signal'] = "CLOSED"
+            now = datetime.now(timezone.utc)
+            time_diff = (market['closing_time_utc'] - now).total_seconds() / 60  # minutes
+            
+            # Skip markets that already closed
+            if time_diff < -60:  # Closed more than 1 hour ago
+                market['signal'] = "ALREADY CLOSED"
+                skipped += 1
                 continue
             
             current_price = self.fetch_current_price(market['asset'])
             if not current_price:
                 market['signal'] = "PRICE FETCH FAILED"
+                skipped += 1
                 continue
             
             market['current_price'] = current_price
@@ -175,9 +209,13 @@ class LimitlessBot:
                 'signal': signal,
                 'bet_type': bet_type,
                 'edge_score': score,
-                'bet_quality': quality
+                'bet_quality': quality,
+                'minutes_until_close': int(time_diff)
             })
+            
+            analyzed += 1
         
+        print(f"   Analyzed: {analyzed}, Skipped: {skipped}")
         return markets
     
     def send_telegram_alert(self, market, minutes_left):
@@ -242,24 +280,28 @@ class LimitlessBot:
             
             # 3. Send alerts for ALL markets closing in 1 hour
             now = datetime.now(timezone.utc)
-            print(f"\n📱 Sending Telegram alerts for markets closing in {ALERT_WINDOW_MINUTES} minutes...")
+            print(f"\n📱 Checking markets closing in {ALERT_WINDOW_MINUTES} minutes...")
             
             for market in markets:
-                if market.get('current_price'):
-                    minutes_left = (market['closing_time_utc'] - now).total_seconds() / 60
+                if market.get('current_price') and market.get('minutes_until_close'):
+                    minutes_left = market['minutes_until_close']
                     
                     # Only alert for markets closing in our window
                     if 0 < minutes_left <= ALERT_WINDOW_MINUTES:
-                        if self.send_telegram_alert(market, int(minutes_left)):
-                            print(f"   ✅ {market['asset']}: {market['signal']} ({market['price_diff_percent']:+.2f}%)")
+                        print(f"   🔔 {market['asset']}: {market['signal']} ({market['price_diff_percent']:+.2f}%), closes in {minutes_left}min")
+                        
+                        if self.send_telegram_alert(market, minutes_left):
+                            print(f"      ✅ Telegram alert sent!")
                             alerts_sent += 1
                             time.sleep(0.5)  # Small delay between messages
             
-            # 4. Summary
-            perfect = len([m for m in markets if m['bet_quality'] == 'PERFECT'])
-            good = len([m for m in markets if m['bet_quality'] == 'GOOD'])
-            no_bet = len([m for m in markets if m['signal'] == 'NO BET'])
-            avoid = len([m for m in markets if m['signal'] == 'AVOID'])
+            # 4. Count signals
+            perfect = len([m for m in markets if m.get('bet_quality') == 'PERFECT'])
+            good = len([m for m in markets if m.get('bet_quality') == 'GOOD'])
+            no_bet = len([m for m in markets if m.get('signal') == 'NO BET'])
+            avoid = len([m for m in markets if m.get('signal') == 'AVOID'])
+            closed = len([m for m in markets if m.get('signal') == 'ALREADY CLOSED'])
+            failed = len([m for m in markets if m.get('signal') == 'PRICE FETCH FAILED'])
             
             print(f"\n{'='*70}")
             print("📊 2-HOUR SCAN COMPLETE")
@@ -269,12 +311,22 @@ class LimitlessBot:
             print(f"   ✅ Good bets: {good}")
             print(f"   ➖ No bets: {no_bet}")
             print(f"   ⛔ Avoid: {avoid}")
+            print(f"   🔒 Already closed: {closed}")
+            print(f"   ❌ Price fetch failed: {failed}")
             print(f"   📱 Alerts sent: {alerts_sent}")
             
             # Next 2-hour scan
             next_scan = now + timedelta(hours=2)
             print(f"   ⏰ Next scan: {next_scan.strftime('%H:%M UTC')}")
             print(f"{'='*70}")
+            
+            # DEBUG: Show first 3 markets
+            print(f"\n🔍 DEBUG - First 3 markets:")
+            for i, market in enumerate(markets[:3]):
+                signal = market.get('signal', 'NO SIGNAL')
+                price = f"${market.get('current_price', 0):.6f}" if market.get('current_price') else "NO PRICE"
+                diff = f"{market.get('price_diff_percent', 0):+.2f}%" if market.get('price_diff_percent') else "N/A"
+                print(f"  {i+1}. {market['asset']}: {signal}, Price: {price}, Diff: {diff}")
             
         except Exception as e:
             print(f"❌ Error: {e}")
