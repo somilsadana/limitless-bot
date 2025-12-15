@@ -118,29 +118,55 @@ class LimitlessBot:
             return current_utc + timedelta(days=1)
     
     def fetch_current_price(self, asset):
-        """Get live price from Binance."""
+        """Get live price from CoinGecko API."""
         try:
-            symbol_map = {
-                'BTC': 'BTCUSDT', 'ETH': 'ETHUSDT', 'BNB': 'BNBUSDT',
-                'SOL': 'SOLUSDT', 'XRP': 'XRPUSDT', 'ADA': 'ADAUSDT',
-                'AVAX': 'AVAXUSDT', 'DOGE': 'DOGEUSDT', 'LINK': 'LINKUSDT',
-                'TRX': 'TRXUSDT', 'LTC': 'LTCUSDT', 'BCH': 'BCHUSDT',
-                'XLM': 'XLMUSDT', 'HBAR': 'HBARUSDT', 'SUI': 'SUIUSDT',
-                'PAXG': 'PAXGUSDT', 'CYS': 'CYSUSDT'
+            # Map asset names to CoinGecko IDs
+            coin_id_map = {
+                'BTC': 'bitcoin',
+                'ETH': 'ethereum',
+                'BNB': 'binancecoin',
+                'SOL': 'solana',
+                'XRP': 'ripple',
+                'ADA': 'cardano',
+                'AVAX': 'avalanche-2',
+                'DOGE': 'dogecoin',
+                'LINK': 'chainlink',
+                'TRX': 'tron',
+                'LTC': 'litecoin',
+                'BCH': 'bitcoin-cash',
+                'XLM': 'stellar',
+                'HBAR': 'hedera-hashgraph',
+                'SUI': 'sui',
+                'PAXG': 'pax-gold',
+                'CYS': 'celo'  # Note: Check if this is correct for CYS
             }
             
-            symbol = symbol_map.get(asset)
-            if not symbol:
-                print(f"⚠️  No symbol mapping for {asset}")
+            coin_id = coin_id_map.get(asset)
+            if not coin_id:
+                print(f"⚠️  No CoinGecko ID mapping for {asset}")
                 return None
             
-            url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
-            response = requests.get(url, timeout=10)
+            # CoinGecko API (no key needed for free tier)
+            url = f"https://api.coingecko.com/api/v3/simple/price"
+            params = {
+                'ids': coin_id,
+                'vs_currencies': 'usd'
+            }
+            
+            # Optional: Add a free API key from https://www.coingecko.com/en/api
+            # headers = {'x-cg-demo-api-key': 'YOUR_API_KEY_HERE'}
+            # response = requests.get(url, params=params, headers=headers, timeout=10)
+            
+            response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
-            price = float(data['price'])
             
-            print(f"   💰 {asset}: ${price:.6f}")
+            if coin_id not in data:
+                print(f"⚠️  CoinGecko returned no data for {asset} (ID: {coin_id})")
+                return None
+            
+            price = data[coin_id]['usd']
+            print(f"   💰 {asset}: ${price:.6f} (via CoinGecko)")
             return price
             
         except Exception as e:
