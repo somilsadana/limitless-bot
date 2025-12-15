@@ -317,22 +317,30 @@ class LimitlessBot:
             # 2. Analyze
             markets = self.analyze_markets(markets)
             
-            # 3. Send alerts for ALL markets closing in 1 hour
+            # 3. Send alerts for ALL markets (FIXED - NO TIME WINDOW CHECK)
             now = datetime.now(timezone.utc)
-            print(f"\n📱 Checking markets closing in {ALERT_WINDOW_MINUTES} minutes...")
+            print(f"\n📱 Sending alerts for ALL analyzed markets...")
             
             for market in markets:
-                if market.get('current_price') and market.get('minutes_until_close'):
-                    minutes_left = market['minutes_until_close']
+                # Check if market was successfully analyzed
+                if market.get('current_price') and market.get('price_diff_percent') is not None:
+                    minutes_left = market.get('minutes_until_close', 0)
                     
-                    # Only alert for markets closing in our window
-                    if 0 < minutes_left <= ALERT_WINDOW_MINUTES:
-                        print(f"   🔔 {market['asset']}: {market['signal']} ({market['price_diff_percent']:+.2f}%), closes in {minutes_left}min")
-                        
-                        if self.send_telegram_alert(market, minutes_left):
-                            print(f"      ✅ Telegram alert sent!")
-                            alerts_sent += 1
-                            time.sleep(0.5)  # Small delay between messages
+                    # Send alert for EVERY market, regardless of closing time
+                    signal = market.get('signal', 'UNKNOWN')
+                    diff_pct = market.get('price_diff_percent', 0)
+                    
+                    print(f"   🔔 {market['asset']}: {signal} ({diff_pct:+.2f}%), closes in {minutes_left}min")
+                    
+                    if self.send_telegram_alert(market, minutes_left):
+                        print(f"      ✅ Telegram alert sent!")
+                        alerts_sent += 1
+                        time.sleep(0.5)  # Small delay between messages
+                    else:
+                        print(f"      ❌ Telegram alert failed!")
+                else:
+                    # Market couldn't be analyzed properly
+                    print(f"   ⚠️  Skipping {market['asset']}: {market.get('signal', 'NO DATA')}")
             
             # 4. Count signals
             perfect = len([m for m in markets if m.get('bet_quality') == 'PERFECT'])
